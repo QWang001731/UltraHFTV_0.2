@@ -99,6 +99,85 @@ static void parse_message(
 
         parse_stock_directory(
             p,
+static Level2_Order_Book L2_BOOK_AAPL("AAPL",1000);
+constexpr const char* TARGET_SYMBOL = "AAPL";
+
+
+uint64_t count_A = 0;
+uint64_t count_F = 0;
+uint64_t count_E = 0;
+uint64_t count_C = 0;
+uint64_t count_X = 0;
+uint64_t count_D = 0;
+uint64_t count_U = 0;
+
+
+static bool read_exact(int fd, void* dst, size_t len)
+{
+    auto* p = static_cast<uint8_t*>(dst);
+
+    size_t done = 0;
+
+    while (done < len) {
+        size_t n = ::read(fd, p + done, len - done);
+
+        if (n == 0)
+            return false;
+
+        if (n < 0) {
+            perror("read");
+            return false;
+        }
+
+        done += static_cast<size_t>(n);
+    }
+
+    return true;
+}
+
+static std::string read_stock(const uint8_t* p)
+{
+    std::string s(reinterpret_cast<const char*>(p), 8);
+
+    while (!s.empty() && s.back() == ' ')
+        s.pop_back();
+
+    return s;
+}
+
+
+static void parse_stock_directory(
+    const uint8_t* p,
+    uint16_t len,
+    std::optional<uint16_t>& target_locate)
+{
+    if (len != 39) {
+        std::cerr << "Bad R length: " << len << '\n';
+        return;
+    }
+
+    std::string stock = read_stock(p + 11);
+
+    if (stock == TARGET_SYMBOL) 
+    {
+        std::cout << "AAPL R message:\n";
+
+        for (int i = 0; i < 20; ++i) {
+            printf("%02X ", p[i]);
+        }
+
+        printf("\n");
+
+        target_locate = read_be::read_be16(p + 1);
+
+        std::cout
+            << "Found AAPL, stock locate = "
+            << *target_locate
+            << '\n';
+    }
+
+    return ;
+}
             len,
             target_locate
         );
