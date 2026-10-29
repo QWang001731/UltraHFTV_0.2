@@ -4,21 +4,26 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <csignal>
 
 #include "Level2_order_book.h"
 #include "read_big_endian_number.h"
 
-#include <unistd.h>
 #include <optional>
-#include <fcntl.h>
 
 constexpr uint16_t RX_RING_SIZE = 1024;
 constexpr uint16_t NUM_MBUFS = 8191;
 constexpr uint16_t MBUF_CACHE_SIZE = 250;
 constexpr uint16_t BURST_SIZE = 32;
-
+uint64_t aapl_events = 0;
 static Level2_Order_Book L2_BOOK_AAPL("AAPL",1000);
 constexpr const char* TARGET_SYMBOL = "AAPL";
+static volatile std::sig_atomic_t shutdown_requested = 0;
+
+static void handle_sigint(int)
+{
+    shutdown_requested = 1;
+}
 
 uint64_t count_A = 0;
 uint64_t count_F = 0;
@@ -65,29 +70,6 @@ struct BufferedPacket
 
 
 std::map<uint64_t, BufferedPacket> pending;
-
-static bool read_exact(int fd, void* dst, size_t len)
-{
-    auto* p = static_cast<uint8_t*>(dst);
-
-    size_t done = 0;
-
-    while (done < len) {
-        size_t n = ::read(fd, p + done, len - done);
-
-        if (n == 0)
-            return false;
-
-        if (n < 0) {
-            perror("read");
-            return false;
-        }
-
-        done += static_cast<size_t>(n);
-    }
-
-    return true;
-}
 
 static std::string read_stock(const uint8_t* p)
 {
@@ -210,68 +192,158 @@ case 'U':
     L2_BOOK_AAPL.Replace_order(p);
     break;
 }
+
+++aapl_events;
+
+if (aapl_events % 100000 == 0)
+{
+    std::cout
+        << "\nAAPL events processed: "
+        << aapl_events
+        << '\n';
+
+    L2_BOOK_AAPL.Print_summary();
+}
+
 }
 
 
-bool parse_moldUDP64(const uint8_t *data, size_t len)
+bool parse_moldUDP64(const uint8_t* data, size_t len)
 {
+    constexpr size_t MOLD_HEADER_SIZE = 20;
 
-    if(len < 20)
+    if (len < MOLD_HEADER_SIZE)
     {
+        ++malformed_packets;
         return false;
     }
 
-    const uint8_t *p = data;
-    const uint8_t *end = p + len;
-    
-    uint64_t seq = read_be::read_be64(data + 10);
-    uint16_t count = read_be::read_be16(p + 18);
+    const uint8_t* p   = data;
+    const uint8_t* end = data + len;
 
-    if(!expected_seq.has_value())
+    const uint64_t seq =
+        read_be::read_be64(p + 10);
+
+    const uint16_t count =
+        read_be::read_be16(p + 18);
+
+    //
+    // Sequence validation
+    //
+    if (expected_seq.has_value())
     {
-        expected_seq = seq;
-    }
-    else if(expected_seq != seq)
-    {
-        synchronized = false;
+        if (*expected_seq != seq)
+        {
+            synchronized = false;
+            ++sequence_gaps;
 
-
+            std::cerr
+                << "packet sequence mismatch: expected "
+                << *expected_seq
+                << ", received "
+                << seq
+                << ", message count "
+                << count
+                << '\n';
+        }
+        else
+        {
+            synchronized = true;
+        }
     }
     else
     {
+        //
+        // First packet establishes synchronization.
+        //
         synchronized = true;
-
     }
 
-    if(count == 0 || count == 0xFFFF)
+    //
+    // MoldUDP64 special packet:
+    //
+    // count == 0:
+    // heartbeat
+    //
+    // count == 0xffff:
+    // end-of-session
+    //
+    if (count == 0)
+    {
+        expected_seq = seq;
+        return true;
+    }
+
+    if (count == 0xFFFF)
     {
         return true;
     }
 
-    p += 20;
+    //
+    // Skip MoldUDP64 header
+    //
+    p += MOLD_HEADER_SIZE;
 
-    for(uint16_t i = 0; i < count;i++)
+    //
+    // Parse every message block:
+    //
+    // [2-byte BE length][ITCH payload]
+    //
+    for (uint16_t i = 0; i < count; ++i)
     {
-        if(p + 2 > end)
+        if (static_cast<size_t>(end - p) < 2)
         {
-            malformed_packets++;
+            ++malformed_packets;
             return false;
         }
 
-        uint16_t msg_len = read_be::read_be16(p);
+        const uint16_t msg_len =
+            read_be::read_be16(p);
 
         p += 2;
 
-        if(p + msg_len > end)
+        if (msg_len == 0)
         {
-            malformed_packets++;
+            ++malformed_packets;
             return false;
         }
 
-        parse_ITCH_message(p,msg_len,target_locate);
+        if (static_cast<size_t>(end - p) < msg_len)
+        {
+            ++malformed_packets;
+            return false;
+        }
+
+        parse_ITCH_message(
+            p,
+            msg_len,
+            target_locate
+        );
 
         p += msg_len;
     }
+
+    //
+    // Strict validation:
+    //
+    // Sender shouldn't leave unexplained bytes after
+    // Message Count messages.
+    //
+    if (p != end)
+    {
+        std::cerr
+            << "MoldUDP64 trailing bytes: "
+            << (end - p)
+            << '\n';
+
+        ++malformed_packets;
+        return false;
+    }
+
+    //
+    // Advance ONLY after packet has been fully validated.
+    //
+    expected_seq = seq + count;
 
     return true;
 }
@@ -283,6 +355,10 @@ int main(int argc, char* argv[])
 
     if (ret < 0) {
         rte_exit(EXIT_FAILURE, "EAL init failed\n");
+    }
+
+    if (std::signal(SIGINT, handle_sigint) == SIG_ERR) {
+        rte_exit(EXIT_FAILURE, "Cannot register SIGINT handler\n");
     }
 
     uint16_t nb_ports = rte_eth_dev_count_avail();
@@ -343,9 +419,11 @@ int main(int argc, char* argv[])
 
     printf("DPDK RX started\n");
 
+
+
     rte_mbuf* packets[BURST_SIZE];
 
-    while (true)
+    while (!shutdown_requested)
     {
         uint16_t nb_rx =
             rte_eth_rx_burst(
@@ -480,6 +558,39 @@ int main(int argc, char* argv[])
             rte_pktmbuf_free(m);
         }
     }
+
+    printf("\nReceived Ctrl+C; stopping packet reception.\n");
+
+    rte_eth_stats stats{};
+
+    if (rte_eth_stats_get(port_id, &stats) == 0)
+    {
+        std::cout
+            << "\nDPDK RX stats:\n"
+            << "ipackets: " << stats.ipackets << '\n'
+            << "ibytes:   " << stats.ibytes << '\n'
+            << "imissed:  " << stats.imissed << '\n'
+            << "ierrors:  " << stats.ierrors << '\n'
+            << "rx_nombuf:" << stats.rx_nombuf << '\n';
+    }
+
+    std::cout
+        << "\nAAPL ITCH message counts:\n"
+        << "A: " << count_A << '\n'
+        << "F: " << count_F << '\n'
+        << "E: " << count_E << '\n'
+        << "C: " << count_C << '\n'
+        << "X: " << count_X << '\n'
+        << "D: " << count_D << '\n'
+        << "U: " << count_U << '\n'
+        << "Sequence gaps: " << sequence_gaps << '\n'
+        << "Malformed packets: " << malformed_packets << '\n'
+        << "Fragmented packets: " << fragmented_packets << '\n';
+
+    L2_BOOK_AAPL.Print_summary();
+
+    rte_eth_dev_stop(port_id);
+    rte_eth_dev_close(port_id);
+
     return 0;
 }
-
