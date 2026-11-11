@@ -1,0 +1,638 @@
+#include <rte_eal.h>
+#include <rte_ethdev.h>
+#include <rte_mbuf.h>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <csignal>
+
+#include "Level2_order_book.h"
+#include "read_big_endian_number.h"
+#include <vector>
+#include <optional>
+
+constexpr uint16_t RX_RING_SIZE = 1024;
+constexpr uint16_t NUM_MBUFS = 8191;
+constexpr uint16_t MBUF_CACHE_SIZE = 250;
+constexpr uint16_t BURST_SIZE = 32;
+uint64_t aapl_events = 0;
+static Level2_Order_Book L2_BOOK_AAPL("AAPL",1000);
+constexpr const char* TARGET_SYMBOL = "AAPL";
+static volatile std::sig_atomic_t shutdown_requested = 0;
+
+static void handle_sigint(int)
+{
+    shutdown_requested = 1;
+}
+
+uint64_t count_A = 0;
+uint64_t count_F = 0;
+uint64_t count_E = 0;
+uint64_t count_C = 0;
+uint64_t count_X = 0;
+uint64_t count_D = 0;
+uint64_t count_U = 0;
+
+std::optional<uint16_t> target_locate;
+std::optional<uint64_t> expected_seq;
+
+
+uint64_t fragmented_packets = 0;
+uint64_t malformed_packets  = 0;
+uint64_t sequence_gaps      = 0;
+
+bool synchronized = false;
+
+
+constexpr uint16_t IPV4_MF          = 0x2000;
+constexpr uint16_t IPV4_FRAG_OFFSET = 0x1FFF;
+
+#pragma pack(push, 1)
+
+struct MoldUDP64Header
+{
+    char     session[10];
+    uint64_t sequence_number;
+    uint16_t message_count;
+};
+
+#pragma pack(pop)
+
+
+struct BufferedPacket
+{
+    
+    
+
+
+
+};
+
+
+std::map<uint64_t, BufferedPacket> pending;
+
+static std::string read_stock(const uint8_t* p)
+{
+    std::string s(reinterpret_cast<const char*>(p), 8);
+
+    while (!s.empty() && s.back() == ' ')
+        s.pop_back();
+
+    return s;
+}
+
+
+static void parse_stock_directory(
+    const uint8_t* p,
+    uint16_t len,
+    std::optional<uint16_t>& target_locate)
+{
+    if (len != 39) {
+        std::cerr << "Bad R length: " << len << '\n';
+        return;
+    }
+
+    std::string stock = read_stock(p + 11);
+
+    if (stock == TARGET_SYMBOL) 
+    {
+        std::cout << "AAPL R message:\n";
+
+        for (int i = 0; i < 20; ++i) {
+            printf("%02X ", p[i]);
+        }
+
+        printf("\n");
+
+        target_locate = read_be::read_be16(p + 1);
+
+        std::cout
+            << "Found AAPL, stock locate = "
+            << *target_locate
+            << '\n';
+    }
+
+    return ;
+}
+
+static void parse_ITCH_message(
+    const uint8_t* p,
+    uint16_t len,
+    std::optional<uint16_t>& target_locate)
+{
+    if (len == 0)
+        return;
+
+    char type = static_cast<char>(p[0]);
+
+    // R 消息必须先看，因为我们靠它找 AAPL locate
+    if (type == 'R' && !target_locate.has_value()) {
+
+        parse_stock_directory(
+            p,
+            len,
+            target_locate
+        );
+
+        return;
+    }
+
+    // AAPL locate 还没找到
+    if (!target_locate.has_value()) {
+        return;
+    }
+
+    if (len < 11) {
+        std::cerr << "ITCH message shorter than common header: " << len << '\n';
+        return;
+    }
+
+    // ITCH common header 中：
+    // p[1], p[2] = stock_locate
+    uint16_t locate = read_be::read_be16(p + 1);
+
+    // 不是 AAPL，直接丢掉
+    if (locate != *target_locate) {
+        return;
+    }
+
+switch (type) {
+    case 'A':
+    count_A++;
+    L2_BOOK_AAPL.Add_order(p);
+    break;
+
+case 'F':
+    count_F++;
+    L2_BOOK_AAPL.Add_order(p);
+    break;
+
+case 'E':
+    count_E++;
+    L2_BOOK_AAPL.Execute_order(p);
+    break;
+
+case 'C':
+    count_C++;
+    L2_BOOK_AAPL.Execute_order(p);
+    break;
+
+case 'X':
+    count_X++;
+    L2_BOOK_AAPL.Cancel_order(p);
+    break;
+
+case 'D':
+    count_D++;
+    L2_BOOK_AAPL.Delete_order(p);
+    break;
+
+case 'U':
+    count_U++;
+    L2_BOOK_AAPL.Replace_order(p);
+    break;
+}
+
+++aapl_events;
+
+if (aapl_events % 100000 == 0)
+{
+    std::cout
+        << "\nAAPL events processed: "
+        << aapl_events
+        << '\n';
+
+    L2_BOOK_AAPL.Print_summary();
+}
+
+}
+
+
+bool parse_moldUDP64(const uint8_t* data, size_t len)
+{
+    constexpr size_t MOLD_HEADER_SIZE = 20;
+
+    if (len < MOLD_HEADER_SIZE)
+    {
+        ++malformed_packets;
+        return false;
+    }
+
+    const uint8_t* p   = data;
+    const uint8_t* end = data + len;
+
+    const uint64_t seq =
+        read_be::read_be64(p + 10);
+
+    const uint16_t count =
+        read_be::read_be16(p + 18);
+
+    //
+    // Sequence validation
+    //
+
+    if (expected_seq.has_value())
+    {
+        if (*expected_seq != seq)
+        {
+            synchronized = false;
+            ++sequence_gaps;
+
+            std::cerr
+                << "packet sequence mismatch: expected "
+                << *expected_seq
+                << ", received "
+                << seq
+                << ", message count "
+                << count
+                << '\n';
+        }
+        else
+        {
+            synchronized = true;
+        }
+    }
+    else
+    {
+        //
+        // First packet establishes synchronization.
+        //
+        synchronized = true;
+    }
+
+    //
+    // MoldUDP64 special packet:
+    //
+    // count == 0:
+    // heartbeat
+    //
+    // count == 0xffff:
+    // end-of-session
+    //
+    if (count == 0)
+    {
+        expected_seq = seq;
+        return true;
+    }
+
+    if (count == 0xFFFF)
+    {
+        return true;
+    }
+
+    //
+    // Skip MoldUDP64 header
+    //
+    p += MOLD_HEADER_SIZE;
+
+    //
+    // Parse every message block:
+    //
+    // [2-byte BE length][ITCH payload]
+    //
+    for (uint16_t i = 0; i < count; ++i)
+    {
+        if (static_cast<size_t>(end - p) < 2)
+        {
+            ++malformed_packets;
+            return false;
+        }
+
+        const uint16_t msg_len =
+            read_be::read_be16(p);
+
+        p += 2;
+
+        if (msg_len == 0)
+        {
+            ++malformed_packets;
+            return false;
+        }
+
+        if (static_cast<size_t>(end - p) < msg_len)
+        {
+            ++malformed_packets;
+            return false;
+        }
+
+        parse_ITCH_message(
+            p,
+            msg_len,
+            target_locate
+        );
+
+        p += msg_len;
+    }
+
+    //
+    // Strict validation:
+    //
+    // Sender shouldn't leave unexplained bytes after
+    // Message Count messages.
+    //
+    if (p != end)
+    {
+        std::cerr
+            << "MoldUDP64 trailing bytes: "
+            << (end - p)
+            << '\n';
+
+        ++malformed_packets;
+        return false;
+    }
+
+    //
+    // Advance ONLY after packet has been fully validated.
+    //
+    expected_seq = seq + count;
+
+    return true;
+}
+
+
+int main(int argc, char* argv[])
+{
+    int ret = rte_eal_init(argc, argv);
+
+    if (ret < 0) {
+        rte_exit(EXIT_FAILURE, "EAL init failed\n");
+    }
+
+    if (std::signal(SIGINT, handle_sigint) == SIG_ERR) {
+        rte_exit(EXIT_FAILURE, "Cannot register SIGINT handler\n");
+    }
+
+    uint16_t nb_ports = rte_eth_dev_count_avail();
+
+    printf("Available ports: %u\n", nb_ports);
+
+    if (nb_ports == 0) {
+        rte_exit(EXIT_FAILURE, "No Ethernet ports found\n");
+    }
+
+    constexpr int num_of_samples = 1000000;
+    
+    std::vector<uint64_t>latency_sample;
+    
+    latency_sample.reserve(num_of_samples);
+
+    rte_mempool* mbuf_pool =
+        rte_pktmbuf_pool_create(
+            "MBUF_POOL",
+            NUM_MBUFS,
+            MBUF_CACHE_SIZE,
+            0,
+            RTE_MBUF_DEFAULT_BUF_SIZE,
+            rte_socket_id()
+        );
+
+    if (mbuf_pool == nullptr) {
+        rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+    }
+
+    uint16_t port_id = 0;
+
+    rte_eth_conf port_conf{};
+
+    ret = rte_eth_dev_configure(
+        port_id,
+        1,   // RX queues
+        0,   // TX queues
+        &port_conf
+    );
+
+    if (ret < 0) {
+        rte_exit(EXIT_FAILURE, "Cannot configure port\n");
+    }
+
+    //fill the Rx queue and associate the queue with mbuf_pool, so that PMD can fill the ring with IOVA of the
+    // data buffer that free mbuf is pointing to
+    ret = rte_eth_rx_queue_setup(
+        port_id,
+        0,
+        RX_RING_SIZE,
+        rte_eth_dev_socket_id(port_id),
+        nullptr,
+        mbuf_pool
+    );
+
+    if (ret < 0) 
+    {
+        rte_exit(EXIT_FAILURE, "Cannot setup RX queue\n");
+    }
+
+    ret = rte_eth_dev_start(port_id);
+
+    if (ret < 0) 
+    {
+        rte_exit(EXIT_FAILURE, "Cannot start port\n");
+    }
+
+    printf("DPDK RX started\n");
+
+    rte_mbuf* packets[BURST_SIZE];
+
+    while (!shutdown_requested)
+    {
+        uint16_t nb_rx =
+            rte_eth_rx_burst(
+                port_id,
+                0,
+                packets,
+                BURST_SIZE
+            );
+
+        for (uint16_t i = 0; i < nb_rx; ++i)
+        {
+            rte_mbuf* m = packets[i];
+
+            if (m->nb_segs != 1)
+            {
+                rte_pktmbuf_free(m);
+                continue;
+            }
+
+            uint8_t* frame =
+                rte_pktmbuf_mtod(m, uint8_t*);
+
+            size_t len =
+                rte_pktmbuf_pkt_len(m);
+
+            uint8_t* end =
+                frame + len;
+
+            // Ethernet
+            if (len < sizeof(rte_ether_hdr))
+            {
+                malformed_packets++;
+                rte_pktmbuf_free(m);
+                continue;
+            }
+
+            auto* eth = reinterpret_cast<rte_ether_hdr*>(frame);
+
+            if (eth->ether_type !=
+                rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))
+            {
+                malformed_packets++;
+                rte_pktmbuf_free(m);
+                continue;
+            }
+
+            // IPv4
+            uint8_t* ip_ptr =
+                frame + sizeof(rte_ether_hdr);
+
+            if (ip_ptr + sizeof(rte_ipv4_hdr) > end)
+            {
+                malformed_packets++;
+                rte_pktmbuf_free(m);
+                continue;
+            }
+
+            auto* ip = reinterpret_cast<rte_ipv4_hdr*>(ip_ptr);
+
+            uint16_t frag = rte_be_to_cpu_16(ip->fragment_offset);
+
+            if ((frag & 0x2000) ||
+                (frag & 0x1FFF))
+            {
+                ++fragmented_packets;
+
+                rte_pktmbuf_free(m);
+
+                continue;
+            }
+
+            uint16_t ip_header_len =
+                (ip->version_ihl & 0x0F) * 4;
+
+            if (ip_header_len < sizeof(rte_ipv4_hdr) ||
+                ip_ptr + ip_header_len > end)
+            {
+                malformed_packets++;
+                rte_pktmbuf_free(m);
+                continue;
+            }
+
+            if (ip->next_proto_id != IPPROTO_UDP)
+            {
+                malformed_packets++;
+                rte_pktmbuf_free(m);
+                continue;
+            }
+
+            // UDP
+            uint8_t* udp_ptr =
+                ip_ptr + ip_header_len;
+
+            if (udp_ptr + sizeof(rte_udp_hdr) > end)
+            {
+                malformed_packets++;
+                rte_pktmbuf_free(m);
+                continue;
+            }
+
+            auto* udp =
+                reinterpret_cast<rte_udp_hdr*>(udp_ptr);
+
+            uint16_t udp_len =
+                rte_be_to_cpu_16(udp->dgram_len);
+
+            if (udp_len < sizeof(rte_udp_hdr))
+            {
+                malformed_packets++;
+                rte_pktmbuf_free(m);
+                continue;
+            }
+
+            uint8_t* mold =
+                udp_ptr + sizeof(rte_udp_hdr);
+
+            size_t mold_len =
+                udp_len - sizeof(rte_udp_hdr);
+
+            if (mold + mold_len > end)
+            {
+                malformed_packets++;
+                rte_pktmbuf_free(m);
+                continue;
+            }
+            uint64_t t0=rte_get_tsc_cycles();
+            
+            ret = parse_moldUDP64(mold, mold_len);
+
+            uint64_t t1=rte_get_tsc_cycles();
+
+            if (!ret)
+            {
+                std::cerr << "Bad MoldUDP64 packet\n";
+            }
+
+            if(latency_sample.size() < num_of_samples)
+            {
+                latency_sample.push_back(t1 - t0);
+            }
+
+            rte_pktmbuf_free(m);
+        }
+    }
+
+    printf("\nReceived Ctrl+C; stopping packet reception.\n");
+
+    rte_eth_stats stats{};
+
+    if (rte_eth_stats_get(port_id, &stats) == 0)
+    {
+        std::cout
+            << "\nDPDK RX stats:\n"
+            << "ipackets: " << stats.ipackets << '\n'
+            << "ibytes:   " << stats.ibytes << '\n'
+            << "imissed:  " << stats.imissed << '\n'
+            << "ierrors:  " << stats.ierrors << '\n'
+            << "rx_nombuf:" << stats.rx_nombuf << '\n';
+    }
+
+    std::cout
+        << "\nAAPL ITCH message counts:\n"
+        << "A: " << count_A << '\n'
+        << "F: " << count_F << '\n'
+        << "E: " << count_E << '\n'
+        << "C: " << count_C << '\n'
+        << "X: " << count_X << '\n'
+        << "D: " << count_D << '\n'
+        << "U: " << count_U << '\n'
+        << "Sequence gaps: " << sequence_gaps << '\n'
+        << "Malformed packets: " << malformed_packets << '\n'
+        << "Fragmented packets: " << fragmented_packets << '\n';
+
+    L2_BOOK_AAPL.Print_summary();
+
+    rte_eth_dev_stop(port_id);
+    rte_eth_dev_close(port_id);
+
+    double tsc_hz = rte_get_tsc_hz();
+
+    std::sort(latency_sample.begin(),latency_sample.end());
+
+    std::for_each(latency_sample.begin(),latency_sample.end(),[tsc_hz](uint64_t& a)
+    {
+        a = static_cast<uint64_t>(static_cast<double>(a) * 1e9/ tsc_hz); 
+    });
+    
+    std::cout<<"latency of parsing mold64udp\n";
+
+    std::cout<<"p50: "<<latency_sample[latency_sample.size()/2]<<" ns"<<std::endl;
+
+    std::cout<<"p90: "<<latency_sample[900000]<<" ns"<<std::endl;
+
+    std::cout<<"p99: " <<latency_sample[990000]<<" ns"<<std::endl;
+
+    std::cout<<"p99.99: " <<latency_sample[999900]<<" ns"<<std::endl;
+
+    std::cout<<"p99.999: " <<latency_sample[999990]<<" ns"<<std::endl;
+
+    std::cout<<"max: " <<latency_sample[999999]<<" ns"<<std::endl;
+
+    return 0;
+}
