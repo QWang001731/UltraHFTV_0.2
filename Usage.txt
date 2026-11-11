@@ -1,0 +1,23 @@
+How to benchmarking and profiling the latency of the market data parser
+
+Step 0:
+
+    add static arp of enp7s0f1:
+
+sudo ip neigh replace 10.10.10.2 \
+    lladdr 34:b3:54:0f:69:b0 \
+    nud permanent \
+    dev enp7s0f0
+
+Step1: 
+    
+    Bind interface enp7s0f1 to dpdk using " bash bind_enp7s0f1_to dpdk.sh".
+
+Step2:
+
+    Start sending ITCH packets from one interface using "./itch_replay_sender 01302019.NASDAQ_ITCH50 10.10.10.2 5000 10.10.10.1"
+
+Step3:
+
+    On another terminal, start the market data parser using "sudo ./dpdk_market_data_handler "
+
