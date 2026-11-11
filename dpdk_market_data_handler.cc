@@ -1,14 +1,14 @@
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
-
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
 
 #include "Level2_order_book.h"
 #include "read_big_endian_number.h"
-
+#include <vector>
 #include <optional>
 
 constexpr uint16_t RX_RING_SIZE = 1024;
@@ -230,6 +230,7 @@ bool parse_moldUDP64(const uint8_t* data, size_t len)
     //
     // Sequence validation
     //
+
     if (expected_seq.has_value())
     {
         if (*expected_seq != seq)
@@ -369,6 +370,12 @@ int main(int argc, char* argv[])
         rte_exit(EXIT_FAILURE, "No Ethernet ports found\n");
     }
 
+    constexpr int num_of_samples = 1000000;
+    
+    std::vector<uint64_t>latency_sample;
+    
+    latency_sample.reserve(num_of_samples);
+
     rte_mempool* mbuf_pool =
         rte_pktmbuf_pool_create(
             "MBUF_POOL",
@@ -398,6 +405,8 @@ int main(int argc, char* argv[])
         rte_exit(EXIT_FAILURE, "Cannot configure port\n");
     }
 
+    //fill the Rx queue and associate the queue with mbuf_pool, so that PMD can fill the ring with IOVA of the
+    // data buffer that free mbuf is pointing to
     ret = rte_eth_rx_queue_setup(
         port_id,
         0,
@@ -407,19 +416,19 @@ int main(int argc, char* argv[])
         mbuf_pool
     );
 
-    if (ret < 0) {
+    if (ret < 0) 
+    {
         rte_exit(EXIT_FAILURE, "Cannot setup RX queue\n");
     }
 
     ret = rte_eth_dev_start(port_id);
 
-    if (ret < 0) {
+    if (ret < 0) 
+    {
         rte_exit(EXIT_FAILURE, "Cannot start port\n");
     }
 
     printf("DPDK RX started\n");
-
-
 
     rte_mbuf* packets[BURST_SIZE];
 
@@ -549,10 +558,20 @@ int main(int argc, char* argv[])
                 rte_pktmbuf_free(m);
                 continue;
             }
+            uint64_t t0=rte_get_tsc_cycles();
+            
+            ret = parse_moldUDP64(mold, mold_len);
 
-            if (!parse_moldUDP64(mold, mold_len))
+            uint64_t t1=rte_get_tsc_cycles();
+
+            if (!ret)
             {
                 std::cerr << "Bad MoldUDP64 packet\n";
+            }
+
+            if(latency_sample.size() < num_of_samples)
+            {
+                latency_sample.push_back(t1 - t0);
             }
 
             rte_pktmbuf_free(m);
@@ -591,6 +610,29 @@ int main(int argc, char* argv[])
 
     rte_eth_dev_stop(port_id);
     rte_eth_dev_close(port_id);
+
+    double tsc_hz = rte_get_tsc_hz();
+
+    std::sort(latency_sample.begin(),latency_sample.end());
+
+    std::for_each(latency_sample.begin(),latency_sample.end(),[tsc_hz](uint64_t& a)
+    {
+        a = static_cast<uint64_t>(static_cast<double>(a) * 1e9/ tsc_hz); 
+    });
+    
+    std::cout<<"latency of parsing mold64udp\n";
+
+    std::cout<<"p50: "<<latency_sample[latency_sample.size()/2]<<" ns"<<std::endl;
+
+    std::cout<<"p90: "<<latency_sample[900000]<<" ns"<<std::endl;
+
+    std::cout<<"p99: " <<latency_sample[990000]<<" ns"<<std::endl;
+
+    std::cout<<"p99.99: " <<latency_sample[999900]<<" ns"<<std::endl;
+
+    std::cout<<"p99.999: " <<latency_sample[999990]<<" ns"<<std::endl;
+
+    std::cout<<"max: " <<latency_sample[999999]<<" ns"<<std::endl;
 
     return 0;
 }
