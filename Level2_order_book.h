@@ -50,6 +50,7 @@ public:
     bool Cancel_order(const uint8_t* p);
     bool Replace_order(const uint8_t* p);
     bool Validate() const;
+    void Print_summary() const;
 
 };
 
@@ -350,11 +351,53 @@ bool Level2_Order_Book::Validate() const
     return true;
 }
 
+void Level2_Order_Book::Print_summary() const
+{
+    uint64_t bid_shares = 0;
+    uint64_t ask_shares = 0;
+
+    for (const auto& [price, level] : _bids)
+        bid_shares += level._shares;
+
+    for (const auto& [price, level] : _asks)
+        ask_shares += level._shares;
+
+    std::cout << "\nOrder book summary for " << _symbol << ":\n"
+              << "Active orders: " << _orders.size() << '\n'
+              << "Bid levels: " << _bids.size()
+              << " (total shares: " << bid_shares << ")\n"
+              << "Ask levels: " << _asks.size()
+              << " (total shares: " << ask_shares << ")\n";
+
+    constexpr size_t SUMMARY_LEVELS = 5;
+
+    std::cout << "Top bids (price, shares):\n";
+    size_t levels_printed = 0;
+    for (const auto& [price, level] : _bids)
+    {
+        std::cout << "  " << price << ", " << level._shares << '\n';
+        if (++levels_printed == SUMMARY_LEVELS)
+            break;
+    }
+    if (levels_printed == 0)
+        std::cout << "  (none)\n";
+
+    std::cout << "Top asks (price, shares):\n";
+    levels_printed = 0;
+    for (const auto& [price, level] : _asks)
+    {
+        std::cout << "  " << price << ", " << level._shares << '\n';
+        if (++levels_printed == SUMMARY_LEVELS)
+            break;
+    }
+    if (levels_printed == 0)
+        std::cout << "  (none)\n";
+}
+
 Level2_Order_Book::~Level2_Order_Book()
 {
     
 }
-
 
 
 
