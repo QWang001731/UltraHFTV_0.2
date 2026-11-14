@@ -370,7 +370,7 @@ int main(int argc, char* argv[])
         rte_exit(EXIT_FAILURE, "No Ethernet ports found\n");
     }
 
-    constexpr int num_of_samples = 1000000;
+    constexpr int num_of_samples = 8000000;
     
     std::vector<uint64_t>latency_sample;
     
@@ -431,6 +431,8 @@ int main(int argc, char* argv[])
     printf("DPDK RX started\n");
 
     rte_mbuf* packets[BURST_SIZE];
+
+    uint64_t counter=0;
 
     while (!shutdown_requested)
     {
@@ -558,6 +560,7 @@ int main(int argc, char* argv[])
                 rte_pktmbuf_free(m);
                 continue;
             }
+            counter++;
             uint64_t t0=rte_get_tsc_cycles();
             
             ret = parse_moldUDP64(mold, mold_len);
@@ -624,15 +627,16 @@ int main(int argc, char* argv[])
 
     std::cout<<"p50: "<<latency_sample[latency_sample.size()/2]<<" ns"<<std::endl;
 
-    std::cout<<"p90: "<<latency_sample[900000]<<" ns"<<std::endl;
+    std::cout<<"p90: "<<latency_sample[7200000]<<" ns"<<std::endl;
 
-    std::cout<<"p99: " <<latency_sample[990000]<<" ns"<<std::endl;
+    std::cout<<"p99: " <<latency_sample[7920000]<<" ns"<<std::endl;
 
-    std::cout<<"p99.99: " <<latency_sample[999900]<<" ns"<<std::endl;
+    std::cout<<"p99.99: " <<latency_sample[7999200]<<" ns"<<std::endl;
 
-    std::cout<<"p99.999: " <<latency_sample[999990]<<" ns"<<std::endl;
+    std::cout<<"p99.999: " <<latency_sample[7999920]<<" ns"<<std::endl;
 
-    std::cout<<"max: " <<latency_sample[999999]<<" ns"<<std::endl;
+    std::cout<<"max: " <<latency_sample[7999999]<<" ns"<<std::endl;
 
+    std::cout<<"totally parsed "<<counter<<" mold64udp packets"<<std::endl;
     return 0;
 }

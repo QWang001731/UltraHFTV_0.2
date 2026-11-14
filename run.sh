@@ -23,12 +23,17 @@ echo "dpdk parser running with tid  $pid"
 
 echo "waiting for dpdk telemetry thread to start "
 
-sleep 10
+VAR=10
+while [ $VAR -gt 0 ];do
+    echo "wait for "$VAR" second"
+    sleep 1
+    ((VAR--))
+done
 
 while read -r TID NAME;do
     case "$NAME" in
         dpdk_market_dat)
-        echo "Pinning parser TID $TID to cpu6"
+         echo "Pinning parser TID $TID to cpu6"
         sudo taskset -pc 6 "$TID"
         ;;
         *)
@@ -39,12 +44,22 @@ esac
 
 done < <(ps -T -p "$pid" -o tid=,comm=)
 
-
-
 echo "starting replayer..."
-
 gnome-terminal -- bash -c '
     cd ~/ultraHFT
     ./itch_replay_sender 01302019.NASDAQ_ITCH50 10.10.10.2 5000 10.10.10.1
     exec bash
 '
+
+if false;then
+echo "starting perf..."
+gnome-terminal -- bash -c '
+    cd ~/ultraHFT
+    echo "Profiling TID: $1"
+    sudo perf stat -t $1 \
+    -e context-switches,cpu-migrations,cycles,instructions \
+    -- sleep 30
+    exec bash
+' _ "$pid"
+fi
+exit 0
